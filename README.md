@@ -1,69 +1,106 @@
-# 👁️ CCTV AI Python (YOLOv11n)
+# CivicNode AI Server (YOLOv11n)
 
-Projek *Proof of Concept* (PoC) buat sistem CCTV cerdas berbasis AI yang jalan secara *real-time*. Di-support pakai **YOLOv11 Nano** buat *object detection* yang enteng tapi akurat, dan dibikin dengan arsitektur modular + *multithreading* buat narik video dari *IP Webcam/Smartphone* tanpa *bottleneck*. 
+Komponen AI untuk platform CivicNode — membaca stream kamera DroidCam, menjalankan deteksi sampah real-time dengan YOLO, lalu meneruskan hasilnya ke backend dan frontend.
 
 ---
 
-## 🚀 Fitur Utama
+## Arsitektur
 
-- **Real-time Object Detection**: Ngandelin model `YOLOv11n` dari Ultralytics, sanggup jalan mulus di Edge/GPU jadul kaya GTX 1050 Ti.
-- **Multithreaded Camera Siphon**: *Feed* video ditarik di *background thread* pake `camera.py`. Main thread (AI) tinggal nyedot *frame* terbaru, *no lag, no stuttering*.
-- **Config Driven**: Tinggal ganti IP Kamera lu atau *secret keys* lewat `.env` yang udah kepisah rapi sama source code. 
-- **Auto Hardware Fallback**: Kalau Mesin/PC lu nggak punya CUDA/GPU NVIDIA, script bakal otomatis maksa *fallback* ke CPU (meski agak ngos-ngosan).
+```
+DroidCam ──(MJPEG)──→ AI Server (server.py)
+                            │
+                            ├─(POST /api/detection tiap 1 detik)──→ Backend
+                            │
+                            └─(MJPEG stream ber-bounding-box)──→ Frontend
+```
 
-## 🛠️ Tech Stack & Prerequisite
+- AI server adalah **satu-satunya** yang connect ke DroidCam (DroidCam hanya support 1 koneksi MJPEG)
+- Frontend tidak connect ke DroidCam langsung — stream diambil dari AI server
+- Backend menerima data deteksi untuk disimpan ke DB dan ditampilkan di dashboard
+
+---
+
+## Tech Stack
 
 - `Python 3.10+`
-- `ultralytics` (YOLO)
-- `opencv-python` (Visi Komputer & GUI)
-- `PyTorch` (Disarankan yg *CUDA enabled*)
-- `python-dotenv`
+- `ultralytics` — YOLO inference
+- `opencv-python` — baca & proses frame video
+- `flask` — HTTP server + MJPEG streaming
+- `requests` — komunikasi ke backend
+- `PyTorch` — disarankan versi CUDA untuk performa optimal
+- `python-dotenv` — konfigurasi lewat `.env`
 
-## ⚙️ Cara Setup
+---
 
-1. **Clone Repo**
-   ```bash
-   git clone https://github.com/Deearss/cctv-ai-python.git
-   cd venv_cctv
-   ```
+## Setup
 
-2. **Setup Environtment Variable**
-   Kopi file *example* ke ke konfigurasi rill lu:
-   ```bash
-   cp .env.example .env
-   ```
-   *(Note: Buka `.env` terus set atau timpa nilai `URL_KAMERA` sesuai IP dari aplikasi IP Webcam di HP lu!)*
+**1. Aktifkan virtual environment**
+```bash
+source bin/activate
+```
 
-3. **Install Dependencies**
-   ```bash
-   pip install -r requirements.txt
-   ```
-   *(Penting: kalau lu pakai CUDA, mending pastiin Pytorch diinstall manual ngikutin instruksi situs resminya biar GPU lu kebaca).*
+**2. Install dependencies**
+```bash
+pip install -r requirements.txt
+```
+> Kalau pakai CUDA, install PyTorch manual sesuai instruksi di pytorch.org agar GPU terbaca.
 
-## 🎮 Cara Pakai
+**3. Konfigurasi `.env`**
+```bash
+cp .env.example .env
+```
+Isi nilainya:
+```env
+BACKEND_URL=http://localhost:3001
+AI_SERVER_SECRET=<sama dengan yang di backend .env>
+STREAM_PORT=5001
+DETECTION_INTERVAL=1
+```
+> `URL_KAMERA` hanya diperlukan untuk `the_eye.py` dan `the_brain.py` (test mandiri).
 
-Gue mecah filenya biar lebih enak di-test satu-satu:
+---
 
-### 1. Test Hardware & Kamera (The Eye)
-Jalanin skrip ini buat ngecek GPU dan mastiin HP lu beneran nyambung lewat WiFi (nggak dipakein AI dulu).
+## Cara Pakai
+
+### Jalanin AI Server (integrasi penuh)
+```bash
+python server.py
+```
+Server akan:
+1. Ambil daftar kamera aktif dari backend (`GET /api/cctv/active`)
+2. Buka stream per kamera di background thread
+3. Jalankan YOLO inference + gambar bounding box
+4. Expose MJPEG stream di `http://0.0.0.0:5001/stream/<cctv_id>`
+5. Kirim deteksi ke backend tiap `DETECTION_INTERVAL` detik
+
+**Endpoints:**
+- `GET /stream/<cctv_id>` — MJPEG stream ber-bounding-box
+- `GET /health` — status server + daftar kamera aktif
+
+---
+
+### Test mandiri (tanpa backend)
+
+**Test koneksi kamera + hardware:**
 ```bash
 python the_eye.py
 ```
 
-### 2. Mulai AI CCTV (The Brain)
-Skrip utama buat deteksi AI! Ini bakal download `yolo11n.pt` otomatis (kalau belum ada) terus nampilin *inferencing* secara *real-time*.
+**Test YOLO inference lokal (tampil di window OpenCV):**
 ```bash
 python the_brain.py
 ```
 
-## 📂 Struktur Repositori
+---
 
-- **`config.py`**: Jantung konfigurasi, ngatur IP Webcam, *keys*, dan *threshold* AI.
-- **`utils.py`**: Fungsi rapih buat nyari dan nentuin kapabilitas perangkat keras.
-- **`camera.py`**: Kelas magis (`VideoStream`) buat baca feed video asinkronus (*multithreading*).
-- **`the_eye.py`**: Skrip diagnostik *streaming* dan *hardware test*.
-- **`the_brain.py`**: Modul pusat, integrasi model AI ke *loop* visual.
+## Struktur File
 
-<br/>
-
-> *Built with systems design mindset for maintainability and scalability.* 🗿
+| File | Fungsi |
+|---|---|
+| `server.py` | Entry point utama — Flask server + integrasi backend |
+| `config.py` | Semua konfigurasi (URL, secret, threshold, port) |
+| `camera.py` | `VideoStream` — baca frame kamera di background thread |
+| `utils.py` | Deteksi hardware (CUDA / CPU fallback) |
+| `the_eye.py` | Test koneksi kamera & hardware |
+| `the_brain.py` | Test YOLO inference lokal (tanpa server) |
+| `yolo11n.pt` | Model YOLO Nano (di-download otomatis kalau belum ada) |
