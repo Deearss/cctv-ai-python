@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variable dari file .env
+load_dotenv()
 
 # IP Webcam lu -> Ganti di sini kalau IP nya berubah.
 # Pake Environment Variable kalau pengen lewat terminal, default ke IP ini.
