@@ -1,0 +1,14 @@
+# Environment and Cache
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+__pycache__/
+
+# AI Models
+*.pt
+
+# Config and Secrets
+.env
