@@ -29,6 +29,55 @@ app = Flask(__name__)
 # State per kamera: { cctv_id: { zona_id, frame (bytes|None), detections, lock } }
 camera_states: dict = {}
 
+# ---------------------------------------------------------------------------
+# Mapping kelas COCO → kategori sampah
+# Kelas yang tidak ada di sini dianggap bukan sampah dan tidak dikirim ke backend
+# ---------------------------------------------------------------------------
+TRASH_MAP: dict[str, str] = {
+    # Plastik
+    "bottle"      : "botol plastik",
+    "cup"         : "gelas plastik",
+    "bowl"        : "wadah plastik",
+    "toothbrush"  : "sampah plastik",
+    # Sisa makanan
+    "banana"      : "sisa makanan",
+    "apple"       : "sisa makanan",
+    "orange"      : "sisa makanan",
+    "sandwich"    : "sisa makanan",
+    "hot dog"     : "sisa makanan",
+    "pizza"       : "sisa makanan",
+    "donut"       : "sisa makanan",
+    "cake"        : "sisa makanan",
+    "carrot"      : "sisa makanan",
+    "broccoli"    : "sisa makanan",
+    # Peralatan makan sekali pakai
+    "fork"        : "peralatan makan sekali pakai",
+    "knife"       : "peralatan makan sekali pakai",
+    "spoon"       : "peralatan makan sekali pakai",
+    # Kaca
+    "wine glass"  : "gelas kaca",
+    "vase"        : "pecahan kaca",
+    # Elektronik
+    "cell phone"  : "sampah elektronik",
+    "remote"      : "sampah elektronik",
+    "keyboard"    : "sampah elektronik",
+    "laptop"      : "sampah elektronik",
+    "tv"          : "sampah elektronik",
+    "hair drier"  : "sampah elektronik",
+    # Lain-lain
+    "umbrella"    : "sampah umum",
+    "handbag"     : "sampah umum",
+    "backpack"    : "sampah umum",
+    "suitcase"    : "sampah umum",
+    "tie"         : "sampah umum",
+    "book"        : "sampah kertas",
+    "scissors"    : "sampah tajam",
+    "teddy bear"  : "sampah umum",
+    "frisbee"     : "sampah umum",
+    "sports ball" : "sampah umum",
+    "kite"        : "sampah umum",
+}
+
 
 # ---------------------------------------------------------------------------
 # Backend helpers
@@ -67,19 +116,35 @@ def process_camera(cctv_id: str, stream_url: str, model: YOLO, device: str):
             time.sleep(0.05)
             continue
 
-        results = model.predict(frame, device=device, conf=CONFIDENCE_THRESHOLD, verbose=False)
-        annotated = results[0].plot()
-
-        # Kumpulkan deteksi dari semua bounding box
+        results    = model.predict(frame, device=device, conf=CONFIDENCE_THRESHOLD, verbose=False)
+        annotated  = frame.copy()
         detections = []
+
         for box in results[0].boxes:
             cls_id     = int(box.cls[0])
-            label      = model.names[cls_id]
+            coco_label = model.names[cls_id]
+            jenis      = TRASH_MAP.get(coco_label)
             confidence = round(float(box.conf[0]), 4)
-            detections.append({"jenis_objek": label, "confidence": confidence})
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+            if jenis:
+                # Sampah — kotak hijau, label bahasa Indonesia
+                color = (0, 255, 0)
+                detections.append({"jenis_objek": jenis, "confidence": confidence})
+            else:
+                # Bukan sampah — kotak abu, label asli COCO (untuk konteks visual)
+                color = (160, 160, 160)
+
+            label_text = f"{jenis or coco_label} {confidence}"
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(annotated, label_text, (x1, max(y1 - 6, 0)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
         # Encode frame ke JPEG (kualitas 80 — cukup untuk streaming)
         _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
+        if detections:
+            print(f"[{cctv_id[:8]}] Sampah terdeteksi: {detections}")
 
         with state["lock"]:
             state["frame"]      = buffer.tobytes()

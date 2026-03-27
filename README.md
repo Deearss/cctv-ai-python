@@ -97,7 +97,7 @@ python the_brain.py
 
 | File | Fungsi |
 |---|---|
-| `server.py` | Entry point utama — Flask server + integrasi backend |
+| `server.py` | Entry point utama — Flask server + integrasi backend + TRASH_MAP filter |
 | `config.py` | Semua konfigurasi (URL, secret, threshold, port) |
 | `camera.py` | `VideoStream` — baca frame kamera di background thread |
 | `utils.py` | Deteksi hardware (CUDA / CPU fallback) |
