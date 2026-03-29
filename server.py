@@ -135,12 +135,11 @@ def process_camera(cctv_id: str, stream_url: str, model, device: str):
             for box in results[0].boxes:
                 cls_id     = int(box.cls[0])
                 coco_label = model.names[cls_id]
-                jenis      = TRASH_MAP.get(coco_label)
+                jenis      = TRASH_MAP.get(coco_label) or coco_label # Gunakan label default (car, person, dll) jika bukan sampah
                 confidence = round(float(box.conf[0]), 4)
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
-                if jenis:
-                    raw_detections.append((x1, y1, x2, y2, jenis, confidence))
+                raw_detections.append((x1, y1, x2, y2, jenis, confidence))
 
             # Teruskan ke Layer 1 (Math Tracker)
             tracked_objects = tracker.update(raw_detections)
