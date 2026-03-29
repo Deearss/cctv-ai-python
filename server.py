@@ -180,9 +180,11 @@ def process_camera(cctv_id: str, stream_url: str, model, device: str):
 
         # 3. Encode frame ke JPEG (kualitas 60 cukup, kurangi bandwidth mjpeg)
         _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
+        _, raw_buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
         with state["lock"]:
             state["frame"] = buffer.tobytes()
+            state["raw_frame"] = raw_buffer.tobytes()
 
         # Biar CPU nggak mentok 100% nge-loop terus karena cap.read() instan
         time.sleep(0.03)
@@ -245,6 +247,7 @@ def sync_cameras():
                 "nama"      : cam.get("nama", cid[:8]),
                 "zona_id"   : cam["zona_id"],
                 "frame"     : None,
+                "raw_frame" : None,
                 "detections": [],
                 "lock"      : threading.Lock(),
             }
@@ -260,7 +263,7 @@ def sync_cameras():
 # Flask routes
 # ---------------------------------------------------------------------------
 
-def generate_mjpeg(cctv_id: str):
+def generate_mjpeg(cctv_id: str, raw: bool = False):
     """Generator frame MJPEG untuk satu kamera."""
     state = camera_states.get(cctv_id)
     if not state:
@@ -268,7 +271,7 @@ def generate_mjpeg(cctv_id: str):
 
     while True:
         with state["lock"]:
-            frame = state["frame"]
+            frame = state["raw_frame"] if raw else state["frame"]
 
         if frame:
             yield (
@@ -292,7 +295,20 @@ def stream(cctv_id):
         time.sleep(1.5)
 
     return Response(
-        generate_mjpeg(cctv_id),
+        generate_mjpeg(cctv_id, raw=False),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
+
+@app.route("/raw_stream/<cctv_id>")
+def raw_stream(cctv_id):
+    if cctv_id not in camera_states:
+        sync_cameras()
+        if cctv_id not in camera_states:
+            return {"error": "Kamera tidak ditemukan"}, 404
+        time.sleep(1.5)
+
+    return Response(
+        generate_mjpeg(cctv_id, raw=True),
         mimetype="multipart/x-mixed-replace; boundary=frame",
     )
 
