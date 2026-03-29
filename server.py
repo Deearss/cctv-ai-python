@@ -1,38 +1,33 @@
 """
-CivicNode AI Server
+CivicNode AI Server (Headless Data Node)
 -------------------
 1. Ambil daftar kamera aktif dari backend (GET /api/cctv/active)
-2. Buka stream DroidCam per kamera di background thread
-3. Jalankan YOLO inference, gambar bounding box ke frame
-4. Expose MJPEG stream per kamera di /stream/<cctv_id>
-5. Kirim hasil deteksi ke backend (POST /api/detection) tiap DETECTION_INTERVAL detik
+2. Buka stream DroidCam/RTSP per kamera di background thread
+3. Jalankan RT-DETR / YOLO inference setiap DETECTION_INTERVAL detik
+4. Lacak objek dengan StationaryTracker (IoU)
+5. Kirim hasil deteksi (status "abandoned" vs "tracking") ke backend (POST /api/detection)
 """
 
-import cv2
 import time
 import threading
 import requests
 from datetime import datetime, timezone
-from flask import Flask, Response
 from ultralytics import YOLO, RTDETR
 
 from config import (
     BACKEND_URL, AI_SERVER_SECRET,
     MODEL_PATH, CONFIDENCE_THRESHOLD,
-    STREAM_PORT, DETECTION_INTERVAL,
+    DETECTION_INTERVAL,
 )
 from utils import get_device
 from camera import VideoStream
 from layer1_tracker import StationaryTracker
 
-app = Flask(__name__)
-
-# State per kamera: { cctv_id: { zona_id, frame (bytes|None), detections, lock } }
+# State per kamera: { cctv_id: { zona_id, detections, lock } }
 camera_states: dict = {}
 
 # ---------------------------------------------------------------------------
 # Mapping kelas COCO → kategori sampah
-# Kelas yang tidak ada di sini dianggap bukan sampah dan tidak dikirim ke backend
 # ---------------------------------------------------------------------------
 TRASH_MAP: dict[str, str] = {
     # Plastik
@@ -100,18 +95,17 @@ def fetch_active_cameras() -> list:
 
 
 # ---------------------------------------------------------------------------
-# Per-camera YOLO thread
+# Per-camera Inference thread
 # ---------------------------------------------------------------------------
 
 def process_camera(cctv_id: str, stream_url: str, model, device: str):
-    """Baca frame dari kamera, jalankan model, track dengan IoU, simpan hasil ke camera_states."""
-    print(f"[{cctv_id[:8]}] Koneksi ke {stream_url} ...")
+    """Baca frame secara berkala (headless), inferensi, dan track dengan IoU."""
+    print(f"[{cctv_id[:8]}] Mulai pemantauan (Headless) ke {stream_url} ...")
     cap = VideoStream(src=stream_url)
     time.sleep(1)  # tunggu buffer pertama
 
     last_predict_time = 0
-    cached_boxes = []  # format: [(x1, y1, x2, y2, color, label_text), ...]
-    PREDICT_INTERVAL = DETECTION_INTERVAL  # Pake interval dari config (misal 60 detik)
+    PREDICT_INTERVAL = DETECTION_INTERVAL
     
     # Init Tracker buat ngecek sampah yang udah diem 5 menit (300 detik)
     tracker = StationaryTracker(iou_threshold=0.45, max_missed=2, abandon_time_seconds=300)
@@ -124,7 +118,6 @@ def process_camera(cctv_id: str, stream_url: str, model, device: str):
             continue
 
         current_time = time.time()
-        annotated = frame.copy()
 
         # 1. Jalankan prediksi AI (Layer 2) hanya jika interval terjadwal terpenuhi
         if current_time - last_predict_time >= PREDICT_INTERVAL:
@@ -135,7 +128,7 @@ def process_camera(cctv_id: str, stream_url: str, model, device: str):
             for box in results[0].boxes:
                 cls_id     = int(box.cls[0])
                 coco_label = model.names[cls_id]
-                jenis      = TRASH_MAP.get(coco_label) or coco_label # Gunakan label default (car, person, dll) jika bukan sampah
+                jenis      = TRASH_MAP.get(coco_label) or coco_label
                 confidence = round(float(box.conf[0]), 4)
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
 
@@ -143,51 +136,24 @@ def process_camera(cctv_id: str, stream_url: str, model, device: str):
 
             # Teruskan ke Layer 1 (Math Tracker)
             tracked_objects = tracker.update(raw_detections)
-            new_boxes = []
             backend_valid_detections = []
 
             for obj in tracked_objects:
-                x1, y1, x2, y2 = obj.box
-                tracked_time = int(current_time - obj.first_seen)
-                
-                if obj.is_abandoned:
-                    color = (0, 0, 255) # MERAH (Valid Abandoned)
-                else:
-                    color = (0, 255, 255) # KUNING (Sedang dilacak)
-                    
-                label_text = f"{obj.jenis} {obj.confidence} ({tracked_time}s)"
-                new_boxes.append((x1, y1, x2, y2, color, label_text))
-                
-                # Kirim ke backend supaya dihitung
+                # Kirim ke backend supaya dihitung / disimpan
                 backend_valid_detections.append({
                     "jenis_objek": obj.jenis, 
                     "confidence": obj.confidence,
                     "status": "abandoned" if obj.is_abandoned else "tracking"
                 })
 
-            cached_boxes = new_boxes
             last_predict_time = current_time
 
             # Simpan deteksi untuk backend thread
             with state["lock"]:
                 state["detections"] = backend_valid_detections
 
-        # 2. Gambar kotak bounding box dari hasil cache terbaru untuk SEMUA frame (sangat cepat)
-        for x1, y1, x2, y2, color, label_text in cached_boxes:
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(annotated, label_text, (x1, max(y1 - 6, 0)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-
-        # 3. Encode frame ke JPEG (kualitas 60 cukup, kurangi bandwidth mjpeg)
-        _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 60])
-        _, raw_buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-
-        with state["lock"]:
-            state["frame"] = buffer.tobytes()
-            state["raw_frame"] = raw_buffer.tobytes()
-
-        # Biar CPU nggak mentok 100% nge-loop terus karena cap.read() instan
-        time.sleep(0.03)
+        # Waktu istirahat CPU minimum agar loop tidak 100% (karena cap.read instan dari background thread)
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +194,6 @@ def send_detections_loop():
 global_model = None
 global_device = None
 
-# ... (rest of imports and initialization)
-
 def sync_cameras():
     """Ambil daftar kamera aktif terbaru dan spawn thread untuk kamera baru."""
     global global_model, global_device
@@ -246,8 +210,6 @@ def sync_cameras():
             camera_states[cid] = {
                 "nama"      : cam.get("nama", cid[:8]),
                 "zona_id"   : cam["zona_id"],
-                "frame"     : None,
-                "raw_frame" : None,
                 "detections": [],
                 "lock"      : threading.Lock(),
             }
@@ -259,70 +221,6 @@ def sync_cameras():
             t.start()
             print(f"[server] Thread kamera (dinamis) '{cam.get('nama', cid[:8])}' dimulai.")
 
-# ---------------------------------------------------------------------------
-# Flask routes
-# ---------------------------------------------------------------------------
-
-def generate_mjpeg(cctv_id: str, raw: bool = False):
-    """Generator frame MJPEG untuk satu kamera."""
-    state = camera_states.get(cctv_id)
-    if not state:
-        return
-
-    while True:
-        with state["lock"]:
-            frame = state["raw_frame"] if raw else state["frame"]
-
-        if frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame
-                + b"\r\n"
-            )
-
-        time.sleep(1 / 30)  # ~30fps
-
-
-@app.route("/stream/<cctv_id>")
-def stream(cctv_id):
-    if cctv_id not in camera_states:
-        # Kamera belum dimuat, coba sinkronisasi ulang
-        sync_cameras()
-        if cctv_id not in camera_states:
-            return {"error": "Kamera tidak ditemukan"}, 404
-        # Tunggu sebentar agar thread baru sempat membaca frame pertama
-        time.sleep(1.5)
-
-    return Response(
-        generate_mjpeg(cctv_id, raw=False),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-@app.route("/raw_stream/<cctv_id>")
-def raw_stream(cctv_id):
-    if cctv_id not in camera_states:
-        sync_cameras()
-        if cctv_id not in camera_states:
-            return {"error": "Kamera tidak ditemukan"}, 404
-        time.sleep(1.5)
-
-    return Response(
-        generate_mjpeg(cctv_id, raw=True),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
-
-
-@app.route("/health")
-def health():
-    return {
-        "status": "ok",
-        "cameras": [
-            {"cctv_id": cid, "nama": state.get("nama", ""), "active": state["frame"] is not None}
-            for cid, state in camera_states.items()
-        ],
-    }
-
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -330,7 +228,7 @@ def health():
 
 def main():
     global global_model, global_device
-    print("=== CivicNode AI Server ===")
+    print("=== CivicNode AI Server (Headless Data Node) ===")
 
     # 1. Load Model (RT-DETR atau YOLO biasa)
     print(f"[server] Loading Model ({MODEL_PATH})...")
@@ -345,18 +243,22 @@ def main():
     sync_cameras()
     
     if not camera_states:
-        print("[server] Tidak ada kamera aktif saat startup. Server tetap berjalan dan akan memuat kamera secara dinamis.")
+        print("[server] Tidak ada kamera aktif saat startup. Akan tetap mengecek kamera secara dinamis.")
 
-    # 4. Start detection sender thread
+    # 3. Start detection sender thread
     t = threading.Thread(target=send_detections_loop, daemon=True)
     t.start()
-    print(f"[server] Detection sender aktif, interval {DETECTION_INTERVAL} detik.")
+    print(f"[server] Detections sender aktif, pooling tiap {DETECTION_INTERVAL} detik.")
 
-    # 5. Start Flask
-    print(f"\n[server] Server jalan di http://0.0.0.0:{STREAM_PORT}")
-    print(f"[server] Stream URL: http://<IP_SERVER>:{STREAM_PORT}/stream/<cctv_id>")
-    print(f"[server] Health:     http://<IP_SERVER>:{STREAM_PORT}/health\n")
-    app.run(host="0.0.0.0", port=STREAM_PORT, threaded=True)
+    # 4. Daemon Loop
+    print(f"[server] AI Server berjalan dalam mode Headless.")
+    try:
+        while True:
+            time.sleep(60) # Cek kamera aktif baru tiap 60 detik
+            sync_cameras()
+            print(f"[server] Health check: {len(camera_states)} nodes active.")
+    except KeyboardInterrupt:
+        print("\n[server] Menghentikan server...")
 
 
 if __name__ == "__main__":
